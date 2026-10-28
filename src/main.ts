@@ -200,6 +200,7 @@ export default class SimpleGitSync extends Plugin {
 				fs: vaultFs(this.app),
 				dir: '/',
 				http,
+				url: s.url,
 				token: this.token(),
 				author: { name: s.authorName, email: s.authorEmail },
 				log: (text) => this.addLog(text),

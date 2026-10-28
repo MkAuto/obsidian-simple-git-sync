@@ -242,6 +242,8 @@ export interface BuiltinOptions {
 	fs: Fs;
 	dir: string;
 	http: HttpClient;
+	/** Replaces origin's URL, if set: a desktop repo cloned over SSH has an origin isomorphic-git can't use. */
+	url?: string;
 	token: string;
 	author: { name: string; email: string };
 	log: Log;
@@ -263,7 +265,8 @@ export class BuiltinGit implements Engine {
 	}
 
 	private get remote() {
-		return { ...this.repo, http: this.o.http, onAuth: auth(this.o.token) };
+		// Refs stay under origin; only the address changes. Native git keeps origin's own URL.
+		return { ...this.repo, http: this.o.http, url: this.o.url || undefined, onAuth: auth(this.o.token) };
 	}
 
 	private async branch() {

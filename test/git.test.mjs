@@ -290,6 +290,27 @@ test('builtin: a fetch after a local commit downloads only what is new, not the 
 	assert.ok(received < 100_000, `downloaded ${received} bytes for a one-line change`);
 });
 
+test('builtin: the URL setting replaces an SSH origin, which isomorphic-git cannot use, for fetch and push', async () => {
+	const { a, b, remote } = setup();
+	sh(b, 'remote', 'set-url', 'origin', 'git@github.com:you/notes.git'); // a desktop vault cloned over SSH
+	write(a, 'note.md', BASE.replace('one', 'one-A'));
+	sh(a, 'commit', '-qam', 'from a');
+	sh(a, 'push', '-q');
+	write(b, 'other.md', 'edited on b\n');
+	const git = new BuiltinGit({ fs, dir: b, http: serve(remote), url: 'https://example.com/remote.git', token: '', author, log: () => {} });
+
+	await git.commitAll('local');
+	await git.fetch();
+	await git.merge(true, async () => {});
+	await git.push();
+
+	assert.equal(read(b, 'note.md'), BASE.replace('one', 'one-A'));
+	sh(a, 'pull', '-q');
+	assert.equal(read(a, 'other.md'), 'edited on b\n');
+	assert.equal(sh(b, 'rev-parse', 'origin/main'), sh(b, 'rev-parse', 'HEAD')); // tracked under origin as before
+	assert.equal(sh(b, 'remote', 'get-url', 'origin').trim(), 'git@github.com:you/notes.git'); // native git keeps its own
+});
+
 test('builtin: a file cut short by an update the app died in is finished, never taken for a newer local edit', async () => {
 	const { a, b } = setup();
 	write(a, 'note.md', BASE.replace('two', 'two-A'));
