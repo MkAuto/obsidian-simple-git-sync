@@ -1,8 +1,9 @@
-import { debounce, FileSystemAdapter, moment, normalizePath, Notice, Platform, Plugin } from 'obsidian';
+import { debounce, FileSystemAdapter, MarkdownView, moment, normalizePath, Notice, Platform, Plugin } from 'obsidian';
 import type { Debouncer } from 'obsidian';
 import { CloneModal } from './clone-modal';
-import { BuiltinGit, NativeGit } from './git';
-import type { Engine } from './git';
+import { ConflictModal } from './conflict-modal';
+import { BuiltinGit, NativeGit, PushRejected } from './git';
+import type { Conflict, Engine } from './git';
 import { DEFAULT_SETTINGS, SettingTab } from './settings';
 import type { Settings } from './settings';
 import { ensureFolder, http, vaultFs } from './vault-io';
@@ -15,15 +16,21 @@ const isQuiet = (e: unknown) =>
 	(e as { network?: boolean } | null)?.network === true ||
 	/Could not resolve host|Connection (timed out|refused|reset)|Network is unreachable|Temporary failure in name resolution/i.test(errorText(e));
 
+// To the millisecond: two syncs in the same second mustn't share a folder and overwrite each other's copies.
+const backupFolder = () => `.trash/simple-git-sync/${moment().format('YYYY-MM-DD_HH-mm-ss-SSS')}`;
+
 export default class SimpleGitSync extends Plugin {
 	settings: Settings = { ...DEFAULT_SETTINGS };
 	/** In memory only, newest last. */
 	log: string[] = [];
 	hasRepo = false;
+	/** Files syncs settled for one side, one entry per file, until settled in the conflicts window. In memory only. */
+	conflicts = new Map<string, Conflict>();
 	private syncing = false;
 	private unloaded = false;
 	private queued: boolean | null = null; // push flag of the one sync waiting behind the running one
 	private lastSync = 0;
+	private resetTry = 0; // when the daily-reset timer last started a sync
 	private statusEl: HTMLElement | null = null;
 	private timers: number[] = [];
 	private pushSoon: Debouncer<[], void> | null = null;
@@ -34,6 +41,15 @@ export default class SimpleGitSync extends Plugin {
 		this.addSettingTab(new SettingTab(this));
 		this.addCommand({ id: 'pull', name: 'Pull', callback: () => void this.sync(false, 'command') });
 		this.addCommand({ id: 'sync', name: 'Sync now', callback: () => void this.sync(true, 'command') });
+		this.addCommand({
+			id: 'conflicts',
+			name: 'Show sync conflicts',
+			checkCallback: (checking) => {
+				if (!this.conflicts.size) return false;
+				if (!checking) this.openConflicts();
+				return true;
+			},
+		});
 		this.addRibbonIcon('refresh-cw', 'Sync now', () => void this.sync(true, 'ribbon'));
 		this.statusEl = this.addStatusBarItem(); // desktop only: mobile has no status bar
 		this.registerInterval(window.setInterval(() => this.showStatus(), 30_000));
@@ -74,6 +90,7 @@ export default class SimpleGitSync extends Plugin {
 
 	async sync(push: boolean, reason: string) {
 		if (!this.hasRepo || this.unloaded) return;
+		push &&= !this.settings.discard; // a discard device never pushes, not even on Sync now
 		if (this.syncing) {
 			this.queued = this.queued === true || push;
 			return;
@@ -84,14 +101,34 @@ export default class SimpleGitSync extends Plugin {
 		try {
 			const s = this.settings;
 			const git = this.engine();
-			await git.commitAll(`Sync: ${s.deviceName} ${moment().format('YYYY-MM-DD HH:mm')}`);
+			await this.saveEditors();
+			const committed = await git.commitAll(`Sync: ${s.deviceName} ${moment().format('YYYY-MM-DD HH:mm')}`);
 			await git.fetch();
-			if (s.discard) {
+			if (s.discard && this.resetDue) {
 				await this.toTrash(await git.localChanges());
 				await git.resetToRemote();
+				s.lastReset = Date.now();
+				await this.saveData(s);
 			} else {
-				await git.merge((paths) => this.toTrash(paths));
-				if (push) await git.push();
+				// Another device can push between this merge and this push. Then merge what it pushed and try again.
+				for (let attempt = 1; ; attempt++) {
+					const conflicts = await git.merge(!s.discard, (found) => this.backUpLosers(found));
+					// The discard device takes the remote's side without a word: it resets every day anyway.
+					if (conflicts.length && !s.discard) this.notifyConflicts(conflicts);
+					if (!push) {
+						// What saveEditors() wrote was saved mid-sync, so it never started the idle push.
+						if (committed) this.pushSoon?.();
+						break;
+					}
+					try {
+						await git.push();
+						break;
+					} catch (e) {
+						if (!(e instanceof PushRejected) || attempt === 3) throw e;
+						this.addLog('push refused: another device pushed first, merging again');
+						await git.fetch();
+					}
+				}
 			}
 			this.lastSync = Date.now();
 		} catch (e) {
@@ -106,12 +143,33 @@ export default class SimpleGitSync extends Plugin {
 		}
 	}
 
+	/**
+	 * Obsidian saves a note about 2 seconds after the last keystroke. Saving now puts that typing in the commit,
+	 * so a pull that changes or deletes the note handles it like any other local edit: merged, or copied to .trash.
+	 * Markdown only: other views (canvas, plugins') may write on every save. save() skips unchanged notes.
+	 */
+	private async saveEditors() {
+		// Background tabs that were never shown hold a placeholder view, with nothing unsaved.
+		const views = this.app.workspace
+			.getLeavesOfType('markdown')
+			.map((leaf) => leaf.view)
+			.filter((view) => view instanceof MarkdownView);
+		await Promise.all(views.map((view) => view.save()));
+	}
+
 	get usesBuiltin() {
 		return !Platform.isDesktop || this.settings.engine === 'builtin';
 	}
 
 	private get pushEnabled() {
 		return this.settings.pushMode !== 'off' && !this.settings.discard;
+	}
+
+	/** Discard mode resets once a day: due when the last reset is older than the latest reset time. */
+	private get resetDue() {
+		const at = moment(this.settings.resetTime, 'HH:mm');
+		if (at.isAfter()) at.subtract(1, 'day');
+		return this.settings.lastReset < at.valueOf();
 	}
 
 	private native() {
@@ -166,14 +224,51 @@ export default class SimpleGitSync extends Plugin {
 	/** Copies the local version of files about to be overwritten. */
 	async toTrash(paths: string[]) {
 		const { adapter } = this.app.vault;
-		const folder = `.trash/simple-git-sync/${moment().format('YYYY-MM-DD_HH-mm-ss')}`;
-		for (const path of paths) {
-			if (!(await adapter.exists(path))) continue;
-			const copy = normalizePath(`${folder}/${path}`);
-			await ensureFolder(this.app.vault, copy.slice(0, copy.lastIndexOf('/')));
-			await adapter.writeBinary(copy, await adapter.readBinary(path));
-			this.addLog(`copied ${path} to ${copy}`);
+		const folder = backupFolder();
+		for (const path of paths) if (await adapter.exists(path)) await this.backUp(folder, path, await adapter.readBinary(path));
+	}
+
+	/** Copies the version that lost each conflict, from whichever side, before the merge writes anything. */
+	private async backUpLosers(conflicts: Conflict[]) {
+		const folder = backupFolder();
+		for (const { path, lost } of conflicts) if (lost) await this.backUp(folder, path, lost.slice().buffer);
+	}
+
+	/** Writes a copy to `folder`/`path`. */
+	private async backUp(folder: string, path: string, data: ArrayBuffer) {
+		const copy = normalizePath(`${folder}/${path}`);
+		await ensureFolder(this.app.vault, copy.slice(0, copy.lastIndexOf('/')));
+		await this.app.vault.adapter.writeBinary(copy, data);
+		this.addLog(`copied ${path} to ${copy}`);
+	}
+
+	/** One notice per sync, until dismissed. Each file stays listed until it's settled in the conflicts window. */
+	private notifyConflicts(found: Conflict[]) {
+		for (const c of found) this.conflicts.set(c.path, c);
+		const names = found.map(({ path }) => path.slice(path.lastIndexOf('/') + 1));
+		const list = names.length > 3 ? `${names.slice(0, 3).join(', ')} and ${names.length - 3} more` : names.join(', ');
+		const message = createFragment((f) => {
+			f.appendText(`Sync conflict: kept the newest version of ${list}. `);
+			f.createEl('button', { text: 'Show' }).addEventListener('click', () => this.openConflicts());
+		});
+		new Notice(message, 0);
+	}
+
+	openConflicts() {
+		new ConflictModal(this).open();
+	}
+
+	/** "Use this version": the current file goes to .trash, and the version the sync overwrote takes its place. */
+	async restore({ path, lost }: Conflict) {
+		await this.toTrash([path]);
+		const fs = vaultFs(this.app).promises;
+		if (lost) {
+			await ensureFolder(this.app.vault, path.slice(0, Math.max(0, path.lastIndexOf('/'))));
+			await fs.writeFile(path, lost);
+		} else if (await this.app.vault.adapter.exists(path)) {
+			await fs.unlink(path);
 		}
+		this.conflicts.delete(path);
 	}
 
 	/**
@@ -208,7 +303,18 @@ export default class SimpleGitSync extends Plugin {
 		const every = (minutes: number, push: boolean, reason: string) => {
 			if (minutes > 0) this.timers.push(this.registerInterval(window.setInterval(() => void this.sync(push, reason), minutes * 60_000)));
 		};
-		every(s.pullInterval, false, 'pull timer');
+		if (s.discard) {
+			// Checked every minute, so the reset lands on time while the app stays open, or soon after the computer
+			// wakes up. A reset that fails (offline, expired token) is retried every 10 minutes, not every minute.
+			const check = () => {
+				if (!this.resetDue || Date.now() - this.resetTry < 600_000) return;
+				this.resetTry = Date.now();
+				void this.sync(false, 'daily reset');
+			};
+			this.timers.push(this.registerInterval(window.setInterval(check, 60_000)));
+		} else {
+			every(s.pullInterval, false, 'pull timer');
+		}
 		if (this.pushEnabled && s.pushMode === 'interval') every(s.pushInterval, true, 'push timer');
 		this.pushSoon = this.pushEnabled && s.pushMode === 'idle' ? debounce(() => void this.sync(true, 'stopped editing'), s.pushIdle * 1000, true) : null;
 	}

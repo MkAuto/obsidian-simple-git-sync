@@ -1,12 +1,13 @@
-// The paths that can lose data: remote-wins merges, the .trash hand-off, and discard.
+// The paths that can lose data: conflict merges (newest wins, or the remote), the .trash hand-off, and discard.
 // Run with `npm test` (Node strips the types from src/git.ts).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { BuiltinGit, NativeGit, clone as cloneVault, CLONING } from '../src/git.ts';
+import { BuiltinGit, NativeGit, PushRejected, clone as cloneVault, CLONING } from '../src/git.ts';
 import { execFile } from 'node:child_process';
 
 const sh = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8' });
@@ -19,7 +20,7 @@ function clone(remote, dir) {
 	sh(join(remote, '..'), 'clone', '-q', '-c', 'core.autocrlf=false', '-c', 'user.name=Test', '-c', 'user.email=test@example.com', remote, dir);
 }
 
-// A bare "GitHub" with note.md, gone.md and img.bin, and two clones: a (other device) and b (this one).
+// A bare "GitHub" with note.md, gone.md, other.md and img.bin, and two clones: a (other device) and b (this one).
 function setup() {
 	const root = fs.mkdtempSync(join(tmpdir(), 'sgs-'));
 	const remote = join(root, 'remote.git');
@@ -30,6 +31,9 @@ function setup() {
 	sh(a, 'checkout', '-q', '-b', 'main');
 	write(a, 'note.md', BASE);
 	write(a, 'gone.md', 'keep me?\n');
+	write(a, 'other.md', 'other\n');
+	fs.mkdirSync(join(a, 'dir/sub'), { recursive: true });
+	write(a, 'dir/sub/deep.md', BASE);
 	fs.writeFileSync(join(a, 'img.bin'), Buffer.from([0, 1, 2]));
 	sh(a, 'add', '-A');
 	sh(a, 'commit', '-qm', 'base');
@@ -51,17 +55,19 @@ function failingWrites(name) {
 	return { fs: { promises: { ...fs.promises, writeFile } }, heal: () => (failing = false) };
 }
 
-// isomorphic-git only clones over HTTP: answer it with git's own upload-pack, as a git server would.
+// isomorphic-git only talks HTTP: answer it with git's own upload-pack and receive-pack, as a git server would.
 const serve = (remote) => ({
 	async request({ url, body }) {
 		const chunks = [];
 		for await (const chunk of body ?? []) chunks.push(chunk);
-		const refs = url.endsWith('?service=git-upload-pack');
+		const service = /git-(upload|receive)-pack/.exec(url)[0];
+		const refs = url.includes('?service=');
+		const line = `# service=${service}\n`;
 		const out = refs
-			? Buffer.concat([Buffer.from('001e# service=git-upload-pack\n0000'), execFileSync('git', ['upload-pack', '--stateless-rpc', '--advertise-refs', remote])])
-			: execFileSync('git', ['upload-pack', '--stateless-rpc', remote], { input: Buffer.concat(chunks) });
+			? Buffer.concat([Buffer.from(`${(line.length + 4).toString(16).padStart(4, '0')}${line}0000`), execFileSync('git', [service.slice(4), '--stateless-rpc', '--advertise-refs', remote])])
+			: execFileSync('git', [service.slice(4), '--stateless-rpc', remote], { input: Buffer.concat(chunks) });
 		const type = refs ? 'advertisement' : 'result';
-		return { url, method: refs ? 'GET' : 'POST', statusCode: 200, statusMessage: 'OK', headers: { 'content-type': `application/x-git-upload-pack-${type}` }, body: [out] };
+		return { url, method: refs ? 'GET' : 'POST', statusCode: 200, statusMessage: 'OK', headers: { 'content-type': `application/x-${service}-${type}` }, body: [out] };
 	},
 });
 
@@ -78,6 +84,31 @@ function diverge(a, b) {
 	write(b, 'new.md', 'only on b\n');
 }
 
+// Both devices commit, at the given times: every conflict kind, and lines only one side changed.
+function divergeAt(a, aTime, b, bTime) {
+	const commitAt = (dir, time, message) => {
+		sh(dir, 'add', '-A');
+		execFileSync('git', ['commit', '-qm', message], { cwd: dir, env: { ...process.env, GIT_AUTHOR_DATE: time, GIT_COMMITTER_DATE: time } });
+	};
+	write(a, 'note.md', BASE.replace('two', 'two-A').replace('five', 'five-A'));
+	fs.rmSync(join(a, 'gone.md'));
+	write(a, 'other.md', 'other, edited on a\n');
+	write(a, 'dir/sub/deep.md', BASE.replace('two', 'two-A'));
+	fs.writeFileSync(join(a, 'img.bin'), Buffer.from([0, 9, 9]));
+	commitAt(a, aTime, 'Sync: Phone 2026-01-01 10:00');
+	sh(a, 'push', '-q');
+	write(b, 'note.md', BASE.replace('two', 'two-B'));
+	write(b, 'gone.md', 'edited on b\n');
+	fs.rmSync(join(b, 'other.md'));
+	write(b, 'dir/sub/deep.md', BASE.replace('two', 'two-B'));
+	fs.writeFileSync(join(b, 'img.bin'), Buffer.from([0, 7, 7]));
+	write(b, 'new.md', 'only on b\n');
+	commitAt(b, bTime, 'Sync: Laptop 2026-01-01 11:00');
+}
+
+const text = (data) => (data ? Buffer.from(data).toString() : null);
+const parents = (dir) => sh(dir, 'rev-list', '--parents', '-n', '1', 'HEAD').trim().split(' ').slice(1);
+
 const engines = {
 	native: (dir) => new NativeGit(dir, execFile, () => {}),
 	builtin: (dir) => new BuiltinGit({ fs, dir, http: null, token: '', author, log: () => {} }),
@@ -86,28 +117,111 @@ const engines = {
 const fetch = (name, engine, dir) => (name === 'native' ? engine.fetch() : sh(dir, 'fetch', '-q'));
 
 for (const [name, make] of Object.entries(engines)) {
-	test(`${name}: remote wins on overlaps, local edits elsewhere survive, overwritten files are handed over first`, async () => {
+	test(`${name}: without newest wins, the remote wins on overlaps, local edits elsewhere survive, losers are handed over first`, async () => {
 		const { a, b } = setup();
 		diverge(a, b);
 		const git = make(b);
 		const handedOver = {};
 
-		await git.commitAll('local');
+		await git.commitAll('local'); // the newer side: it still loses
 		await fetch(name, git, b);
-		await git.merge(async (paths) => {
-			for (const path of paths) handedOver[path] = read(b, path);
+		await git.merge(false, async (conflicts) => {
+			for (const { path, kept, lost } of conflicts) {
+				assert.equal(kept, 'remote');
+				// Nothing written yet: the file on disk is still this device's version, the one that lost.
+				assert.equal(read(b, path), path === 'img.bin' ? read(b, path) : text(lost));
+				handedOver[path] = path === 'img.bin' ? [...lost] : text(lost);
+			}
 		});
 
 		assert.equal(read(b, 'note.md'), BASE.replace('two', 'two-A').replace('five', 'five-B'));
 		assert.equal(read(b, 'gone.md'), null);
 		assert.deepEqual([...fs.readFileSync(join(b, 'img.bin'))], [0, 9, 9]);
 		assert.equal(read(b, 'new.md'), 'only on b\n');
-		// The callback saw b's own versions, before the remote replaced them.
+		// The callback got b's own versions, the ones that lost.
 		assert.deepEqual(Object.keys(handedOver).sort(), ['gone.md', 'img.bin', 'note.md']);
 		assert.equal(handedOver['note.md'], BASE.replace('two', 'two-B').replace('five', 'five-B'));
 		assert.equal(handedOver['gone.md'], 'edited on b\n');
+		assert.deepEqual(handedOver['img.bin'], [0, 7, 7]);
 		assert.equal(sh(b, 'status', '--porcelain'), '');
 	});
+
+	test(`${name}: newest wins: a later edit here beats an earlier one there, the remote's losers are handed over`, async () => {
+		const { a, b } = setup();
+		divergeAt(a, '2026-01-01T10:00:00', b, '2026-01-01T11:00:00');
+		const git = make(b);
+		const local = sh(b, 'rev-parse', 'HEAD').trim();
+		await fetch(name, git, b);
+		const conflicts = await git.merge(true, async () => {});
+
+		assert.equal(read(b, 'note.md'), BASE.replace('two', 'two-B').replace('five', 'five-A')); // five: only a changed it
+		assert.equal(read(b, 'gone.md'), 'edited on b\n'); // the edit is newer than a's delete
+		assert.equal(read(b, 'other.md'), null); // the delete is newer than a's edit
+		assert.deepEqual([...fs.readFileSync(join(b, 'img.bin'))], [0, 7, 7]);
+		assert.equal(read(b, 'new.md'), 'only on b\n');
+		assert.equal(read(b, 'dir/sub/deep.md'), BASE.replace('two', 'two-B')); // in a folder too
+		const byPath = Object.fromEntries(conflicts.map((c) => [c.path, c]));
+		assert.deepEqual(Object.keys(byPath).sort(), ['dir/sub/deep.md', 'gone.md', 'img.bin', 'note.md', 'other.md']);
+		assert.equal(text(byPath['dir/sub/deep.md'].lost), BASE.replace('two', 'two-A'));
+		for (const c of conflicts) assert.equal(c.kept, 'local');
+		assert.equal(text(byPath['note.md'].lost), BASE.replace('two', 'two-A').replace('five', 'five-A'));
+		assert.equal(byPath['gone.md'].lost, null); // a deleted it
+		assert.equal(text(byPath['other.md'].lost), 'other, edited on a\n');
+		assert.deepEqual([...byPath['img.bin'].lost], [0, 9, 9]);
+		assert.deepEqual(byPath['note.md'].remote, { time: Date.parse('2026-01-01T10:00:00'), device: 'Phone' });
+		assert.deepEqual(byPath['note.md'].local, { time: Date.parse('2026-01-01T11:00:00'), device: 'Laptop' });
+		// A real merge of both sides, committed, nothing left over.
+		assert.deepEqual(parents(b), [local, sh(b, 'rev-parse', 'origin/main').trim()]);
+		assert.equal(sh(b, 'status', '--porcelain'), '');
+		assert.doesNotMatch(sh(b, 'log', '--format=%s'), /Settle conflicts|Take remote side/);
+	});
+
+	test(`${name}: a push refused because another device pushed first says so, and never suggests forcing`, async () => {
+		const { a, b, remote } = setup();
+		const git = name === 'native' ? make(b) : new BuiltinGit({ fs, dir: b, http: serve(remote), token: '', author, log: () => {} });
+		if (name === 'builtin') sh(b, 'remote', 'set-url', 'origin', 'https://example.com/remote.git');
+		write(b, 'note.md', BASE.replace('one', 'one-B'));
+		await git.commitAll('local');
+		// Between this device's merge and its push, the other one pushes.
+		write(a, 'note.md', BASE.replace('five', 'five-A'));
+		sh(a, 'commit', '-qam', 'from a');
+		sh(a, 'push', '-q');
+
+		const error = await git.push().then(() => null, (e) => e);
+		assert.ok(error instanceof PushRejected, `got ${error}`);
+		assert.doesNotMatch(error.message, /force/i);
+		// Merging again lets the next push through, with both devices' work.
+		await git.fetch();
+		await git.merge(true, async () => {});
+		await git.push();
+		sh(a, 'pull', '-q');
+		assert.equal(read(a, 'note.md'), BASE.replace('one', 'one-B').replace('five', 'five-A'));
+	});
+
+	for (const [when, aTime] of [['an earlier', '2026-01-01T12:00:00'], ['an equally old', '2026-01-01T11:00:00']]) {
+		test(`${name}: newest wins: ${when} edit here loses to the remote, this device's losers are handed over`, async () => {
+			const { a, b } = setup();
+			divergeAt(a, aTime, b, '2026-01-01T11:00:00');
+			const git = make(b);
+			await fetch(name, git, b);
+			const conflicts = await git.merge(true, async () => {});
+
+			assert.equal(read(b, 'note.md'), BASE.replace('two', 'two-A').replace('five', 'five-A'));
+			assert.equal(read(b, 'gone.md'), null);
+			assert.equal(read(b, 'other.md'), 'other, edited on a\n');
+			assert.deepEqual([...fs.readFileSync(join(b, 'img.bin'))], [0, 9, 9]);
+			assert.equal(read(b, 'new.md'), 'only on b\n');
+			assert.equal(read(b, 'dir/sub/deep.md'), BASE.replace('two', 'two-A'));
+			const byPath = Object.fromEntries(conflicts.map((c) => [c.path, c]));
+			for (const c of conflicts) assert.equal(c.kept, 'remote');
+			assert.equal(text(byPath['dir/sub/deep.md'].lost), BASE.replace('two', 'two-B'));
+			assert.equal(text(byPath['note.md'].lost), BASE.replace('two', 'two-B'));
+			assert.equal(text(byPath['gone.md'].lost), 'edited on b\n');
+			assert.equal(byPath['other.md'].lost, null); // b deleted it
+			assert.deepEqual([...byPath['img.bin'].lost], [0, 7, 7]);
+			assert.equal(sh(b, 'status', '--porcelain'), '');
+		});
+	}
 
 	test(`${name}: discard lists local changes, then resets to the remote`, async () => {
 		const { a, b } = setup();
@@ -135,15 +249,74 @@ test('builtin: a merge whose file update dies halfway leaves nothing for the nex
 	sh(b, 'fetch', '-q');
 	const flaky = failingWrites('note.md');
 	const git = new BuiltinGit({ fs: flaky.fs, dir: b, http: null, token: '', author, log: () => {} });
-	await assert.rejects(git.merge(async () => {}));
+	await assert.rejects(git.merge(true, async () => {}));
 	flaky.heal();
 
 	await git.commitAll('next sync');
-	await git.merge(async () => {});
+	await git.merge(true, async () => {});
 
 	assert.equal(read(b, 'note.md'), BASE.replace('two', 'two-A'));
 	assert.equal(sh(b, 'diff', '--stat', 'origin/main', 'HEAD'), '');
 	assert.equal(sh(b, 'status', '--porcelain'), '');
+});
+
+test('builtin: a fetch after a local commit downloads only what is new, not the whole repo', async () => {
+	const { a, b, remote } = setup();
+	fs.writeFileSync(join(a, 'big.bin'), randomBytes(1_000_000));
+	sh(a, 'add', '-A');
+	sh(a, 'commit', '-qm', 'big');
+	sh(a, 'push', '-q');
+	sh(b, 'pull', '-q');
+	sh(b, 'remote', 'set-url', 'origin', 'https://example.com/remote.git'); // isomorphic-git only fetches over HTTP
+	write(a, 'note.md', BASE.replace('one', 'one-A'));
+	sh(a, 'commit', '-qam', 'small');
+	sh(a, 'push', '-q');
+	write(b, 'other.md', 'edited on b\n');
+	const server = serve(remote);
+	let received = 0;
+	const http = {
+		async request(req) {
+			const res = await server.request(req);
+			for (const chunk of res.body) received += chunk.length;
+			return res;
+		},
+	};
+	const git = new BuiltinGit({ fs, dir: b, http, token: '', author, log: () => {} });
+
+	await git.commitAll('local'); // a sync commits before it fetches: a commit the server has never seen
+	await git.fetch();
+
+	assert.equal(sh(b, 'rev-parse', 'origin/main'), sh(a, 'rev-parse', 'HEAD'));
+	assert.ok(received < 100_000, `downloaded ${received} bytes for a one-line change`);
+});
+
+test('builtin: a file cut short by an update the app died in is finished, never taken for a newer local edit', async () => {
+	const { a, b } = setup();
+	write(a, 'note.md', BASE.replace('two', 'two-A'));
+	sh(a, 'commit', '-qam', 'from a');
+	sh(a, 'push', '-q');
+	sh(b, 'fetch', '-q');
+	// The app dies while note.md is being written: only its start is on disk.
+	let dying = true;
+	const writeFile = async (path, data, ...rest) => {
+		if (dying && String(path).endsWith('note.md')) {
+			await fs.promises.writeFile(path, data.slice(0, 5));
+			throw new Error('app killed');
+		}
+		return fs.promises.writeFile(path, data, ...rest);
+	};
+	const git = new BuiltinGit({ fs: { promises: { ...fs.promises, writeFile } }, dir: b, http: null, token: '', author, log: () => {} });
+	await assert.rejects(git.merge(true, async () => {}));
+	assert.equal(read(b, 'note.md'), BASE.replace('two', 'two-A').slice(0, 5));
+	dying = false;
+
+	// The next sync, a minute later: its commit would be newer than a's.
+	await git.commitAll('next sync');
+	const conflicts = await git.merge(true, async () => {});
+
+	assert.equal(read(b, 'note.md'), BASE.replace('two', 'two-A'));
+	assert.deepEqual(conflicts, []);
+	assert.equal(sh(b, 'diff', '--stat', 'origin/main', 'HEAD'), '');
 });
 
 test('builtin: a clone that dies halfway leaves no .git, and the next attempt works', async () => {
@@ -201,7 +374,7 @@ test('native: commitAll with nothing to commit, then push after a merge', async 
 	write(b, 'note.md', BASE.replace('five', 'five-B'));
 	assert.equal(await git.commitAll('local'), true);
 	await git.fetch();
-	await git.merge(async () => {});
+	await git.merge(true, async () => {});
 	await git.push();
 
 	sh(a, 'pull', '-q');

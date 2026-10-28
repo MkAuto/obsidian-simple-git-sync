@@ -14,8 +14,14 @@ export async function ensureFolder(vault: Vault, path: string) {
 	if (path === '/' || (await vault.adapter.exists(path))) return;
 	const slash = path.lastIndexOf('/');
 	if (slash > 0) await ensureFolder(vault, path.slice(0, slash));
-	if (isHidden(path)) await vault.adapter.mkdir(path);
-	else await vault.createFolder(path);
+	try {
+		if (isHidden(path)) await vault.adapter.mkdir(path);
+		else await vault.createFolder(path);
+	} catch (e) {
+		// isomorphic-git makes a checkout's folders all at once, so another call may have made this one since
+		// the check above, and Obsidian refuses to create a folder twice.
+		if (!(await vault.adapter.exists(path))) throw e;
+	}
 }
 
 /**

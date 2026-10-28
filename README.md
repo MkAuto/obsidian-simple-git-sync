@@ -2,7 +2,7 @@
 
 Keeps an Obsidian vault in sync with one git repository, on desktop and mobile, without merge conflicts.
 
-It pulls when you open or return to the app and pushes shortly after you stop editing, so you rarely edit a stale copy. When two devices change the same lines anyway, the remote version wins and your local version is kept in `.trash/simple-git-sync/`.
+It pulls when you open or return to the app and pushes shortly after you stop editing, so you rarely edit a stale copy. When two devices change the same lines anyway, the most recent change wins, the other version is kept in `.trash/simple-git-sync/`, and a notice lets you swap it back in.
 
 ## Setup
 
@@ -23,8 +23,8 @@ The repository's files, including its `.obsidian` folder, replace the vault's, t
 |---|---|
 | **Pull** | On open and on return to the app, optionally every N minutes, and the **Pull** command. Local changes are committed (not pushed) first. |
 | **Push** | N seconds after you stop editing (default 60), every N minutes, or off. Also when the app goes to the background, best effort. **Sync now** (command and ribbon button) always pushes. |
-| **Conflicts** | Where both sides changed the same lines, the remote wins. Your edits elsewhere in the file are kept. The full local version of every overwritten file is copied to `.trash/simple-git-sync/<time>/`. |
-| **Discard local changes** | Optional, per device. Every pull resets the device to the remote, unpushed commits included, after copying the discarded files to `.trash/simple-git-sync/`. Push is off while it's on. |
+| **Conflicts** | Where both devices changed the same lines, or one deleted a file the other changed, the device that changed the file last wins (by commit time; the remote on a tie). Edits elsewhere in the file are kept from both. The full losing version is copied to `.trash/simple-git-sync/<time>/`, and a notice offers **Show**: each file's losing version, with **Use this version** to bring it back. The **Show sync conflicts** command reopens it until the app restarts. |
+| **Discard local changes** | Optional, per device, for a device you only read on, like a daily checklist. Once a day, at the time you choose, the device resets to the remote, unpushed commits included, after copying the discarded files to `.trash/simple-git-sync/`. Pulls in between keep your changes. Push and the pull timer are off while it's on. |
 | **Errors** | Being offline is silent: the next trigger retries. Other errors show a notice. The full activity log is under Settings → Developer → Show sync log. |
 
 All settings and the open-tabs layout are per device: the plugin adds its `data.json`, `workspace.json` and `workspace-mobile.json` to `.gitignore`.

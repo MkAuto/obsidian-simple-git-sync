@@ -8,6 +8,8 @@ export interface Settings {
 	pullOnOpen: boolean;
 	pullInterval: number; // minutes, 0 = off
 	discard: boolean;
+	resetTime: string; // HH:mm, when discard mode resets this device each day
+	lastReset: number; // when discard mode last reset this device, in ms; not shown
 	pushMode: 'off' | 'idle' | 'interval';
 	pushIdle: number; // seconds
 	pushInterval: number; // minutes
@@ -25,6 +27,8 @@ export const DEFAULT_SETTINGS: Settings = {
 	pullOnOpen: true,
 	pullInterval: 0,
 	discard: false,
+	resetTime: '00:00',
+	lastReset: 0,
 	pushMode: 'idle',
 	pushIdle: 60,
 	pushInterval: 10,
@@ -116,15 +120,27 @@ export class SettingTab extends PluginSettingTab {
 
 		new Setting(el).setName('Pull').setHeading();
 		toggle('Pull on open and on return to the app', '', 'pullOnOpen');
-		number('Pull every N minutes', '0 turns it off.', 'pullInterval');
+		if (!s.discard) number('Pull every N minutes', '0 turns it off.', 'pullInterval');
 		toggle(
-			'Discard local changes before pulling',
-			'Resets this device to the remote on every pull, unpushed commits included. Discarded files are copied to .trash/simple-git-sync/ first. Turns push off.',
+			'Discard local changes once a day',
+			'For a device you only read on, like a daily checklist. Once a day, resets this device to the remote, unpushed commits included. Discarded files are copied to .trash/simple-git-sync/ first. Pulls in between keep your changes. Turns push off.',
 			'discard',
 			true,
 		);
 
-		if (!s.discard) {
+		if (s.discard) {
+			new Setting(el)
+				.setName('Reset at')
+				.setDesc('Every day at this time. If the app is closed then, the first pull after it resets.')
+				.addText((t) => {
+					t.inputEl.type = 'time';
+					t.setValue(s.resetTime).onChange(async (value) => {
+						if (!/^\d\d:\d\d$/.test(value)) return; // cleared or half typed: keep the last time
+						s.resetTime = value;
+						await save();
+					});
+				});
+		} else {
 			new Setting(el).setName('Push').setHeading();
 			new Setting(el).setName('Push automatically').addDropdown((d) =>
 				d
