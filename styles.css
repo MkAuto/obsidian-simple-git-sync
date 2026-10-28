@@ -3,3 +3,7 @@
 	font-family: var(--font-monospace);
 	font-size: var(--font-smallest);
 }
+
+.simple-git-sync-log-row .setting-item-info {
+	display: none;
+}

@@ -5,7 +5,7 @@ Agreed on 2026-10-26. Goal: no more merge conflicts from forgetting to pull, wit
 ## Listing
 
 - id `simple-git-sync`, name "Simple Git Sync", author Keven B., MIT license.
-- Repo `MkAuto/obsidian-simple-git-sync`, `minAppVersion` 1.11.4 (SecretStorage), not desktop-only.
+- Repo `MkAuto/obsidian-simple-git-sync`, `minAppVersion` 1.13.2 (declarative settings, with the secret control), not desktop-only.
 - Community plugin store only. Pushing a tag (`1.2.3`, no `v`) publishes a GitHub release (not a draft).
 
 ## Engines

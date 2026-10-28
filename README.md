@@ -38,7 +38,8 @@ All settings and the open-tabs layout are per device: the plugin adds its `data.
 
 - **Network:** the plugin only talks to the git remote you configure, for fetch, push and clone. There's no telemetry.
 - **Account:** you need an account with your git host. Mobile, and the built-in engine on desktop, need an access token.
-- **Files:** the plugin edits the vault's `.gitignore`, adding its own `data.json`, the two workspace files and `.trash/`. On desktop with the native engine, it runs the installed `git` program in the vault folder.
+- **Files:** the plugin edits the vault's `.gitignore`, adding its own `data.json`, the two workspace files and `.trash/`.
+- **Running programs:** on desktop with the native engine, the plugin runs the `git` program installed on your computer, in the vault folder, through Node's `child_process`. It only ever runs `git`, with arguments the plugin builds itself, and never through a shell (`execFile`), so nothing it passes is read as a shell command. On mobile it runs no programs. With the built-in engine on desktop, it runs only `git config --get` once, when you switch to it, to fill in the URL and your name and email.
 
 Only GitHub is tested. Other HTTPS git hosts that accept a token as the password should work.
 

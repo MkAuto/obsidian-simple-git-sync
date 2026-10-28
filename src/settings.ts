@@ -1,4 +1,5 @@
-import { Platform, PluginSettingTab, SecretComponent, Setting } from 'obsidian';
+import { Platform, PluginSettingTab } from 'obsidian';
+import type { SettingDefinitionItem } from 'obsidian';
 import type SimpleGitSync from './main';
 
 /** All per-device: data.json is gitignored. */
@@ -40,8 +41,6 @@ export const DEFAULT_SETTINGS: Settings = {
 	showLog: false,
 };
 
-type Keys<T> = { [K in keyof Settings]: T extends Settings[K] ? K : never }[keyof Settings];
-
 export class SettingTab extends PluginSettingTab {
 	private plugin: SimpleGitSync;
 
@@ -50,118 +49,114 @@ export class SettingTab extends PluginSettingTab {
 		this.plugin = plugin;
 	}
 
-	display() {
-		const { containerEl: el, plugin } = this;
+	getSettingDefinitions(): SettingDefinitionItem[] {
+		const { plugin } = this;
 		const s = plugin.settings;
-		const save = () => plugin.saveSettings();
-		const redraw = async () => {
-			await save();
-			this.display();
-		};
-		const toggle = (name: string, desc: string, key: Keys<boolean>, rerender = false) =>
-			new Setting(el).setName(name).setDesc(desc).addToggle((t) =>
-				t.setValue(s[key]).onChange(async (value) => {
-					s[key] = value;
-					await (rerender ? redraw() : save());
-				}),
-			);
-		const text = (name: string, desc: string, key: Keys<string>) =>
-			new Setting(el).setName(name).setDesc(desc).addText((t) =>
-				t.setValue(s[key]).onChange(async (value) => {
-					s[key] = value.trim();
-					await save();
-				}),
-			);
-		const number = (name: string, desc: string, key: Keys<number>) =>
-			new Setting(el).setName(name).setDesc(desc).addText((t) => {
-				t.inputEl.type = 'number';
-				t.setValue(String(s[key])).onChange(async (value) => {
-					s[key] = Math.max(0, Number(value) || 0);
-					await save();
-				});
-			});
+		const builtin = () => plugin.usesBuiltin;
+		return [
+			{
+				name: 'No repository in this vault',
+				desc: 'Clone one to start syncing.',
+				visible: () => !plugin.hasRepo,
+				render: (setting) => {
+					setting.addButton((b) => b.setButtonText('Clone').setCta().onClick(() => plugin.openClone()));
+				},
+			},
+			{
+				name: 'Engine',
+				desc: 'Native uses your installed Git and SSH keys. Built-in is what mobile uses: HTTPS and a token.',
+				visible: Platform.isDesktop,
+				control: { type: 'dropdown', key: 'engine', options: { native: 'Native git', builtin: 'Built-in' } },
+			},
+			{ name: 'Repository URL', desc: 'HTTPS, for example https://github.com/you/notes.git', visible: builtin, control: { type: 'text', key: 'url' } },
+			{
+				name: 'Token',
+				desc: 'A fine-grained token with access to this repository only, and contents set to read and write.',
+				visible: builtin,
+				control: { type: 'secret', key: 'token' },
+			},
+			{ name: 'Author name', desc: 'Used for commits from this device.', visible: builtin, control: { type: 'text', key: 'authorName' } },
+			{ name: 'Author email', desc: 'Used for commits from this device.', visible: builtin, control: { type: 'text', key: 'authorEmail' } },
+			{ name: 'Device name', desc: 'Shown in commit messages.', control: { type: 'text', key: 'deviceName' } },
+			{
+				type: 'group',
+				heading: 'Pull',
+				items: [
+					{ name: 'Pull on open and on return to the app', control: { type: 'toggle', key: 'pullOnOpen' } },
+					{ name: 'Pull every N minutes', desc: '0 turns it off.', visible: () => !s.discard, control: { type: 'number', key: 'pullInterval', min: 0 } },
+					{
+						name: 'Discard local changes once a day',
+						desc: 'For a device you only read on, like a daily checklist. Once a day, resets this device to the remote, unpushed commits included. Discarded files are copied to .trash/simple-git-sync/ first. Pulls in between keep your changes. Turns push off.',
+						control: { type: 'toggle', key: 'discard' },
+					},
+					{
+						name: 'Reset at',
+						desc: 'Every day at this time. If the app is closed then, the first pull after it resets.',
+						visible: () => s.discard,
+						// A time picker: the text control has no input type.
+						render: (setting) => {
+							setting.addText((t) => {
+								t.inputEl.type = 'time';
+								t.setValue(s.resetTime).onChange(async (value) => {
+									if (!/^\d\d:\d\d$/.test(value)) return; // cleared or half typed: keep the last time
+									s.resetTime = value;
+									await plugin.saveSettings();
+								});
+							});
+						},
+					},
+				],
+			},
+			{
+				type: 'group',
+				heading: 'Push',
+				visible: () => !s.discard,
+				items: [
+					{
+						name: 'Push automatically',
+						control: { type: 'dropdown', key: 'pushMode', options: { off: 'Off', idle: 'After I stop editing', interval: 'Every N minutes' } },
+					},
+					{ name: 'Seconds after you stop editing', visible: () => s.pushMode === 'idle', control: { type: 'number', key: 'pushIdle', min: 0 } },
+					{ name: 'Push every N minutes', visible: () => s.pushMode === 'interval', control: { type: 'number', key: 'pushInterval', min: 0 } },
+					{
+						name: 'Push when the app goes to the background',
+						desc: 'Best effort: the system may close the app first.',
+						visible: () => s.pushMode !== 'off',
+						control: { type: 'toggle', key: 'pushOnBackground' },
+					},
+				],
+			},
+			{
+				type: 'group',
+				heading: 'Developer',
+				items: [
+					{ name: 'Show sync log', control: { type: 'toggle', key: 'showLog' } },
+					{
+						name: 'Sync log',
+						visible: () => s.showLog,
+						searchable: false,
+						render: (setting) => {
+							setting.settingEl.addClass('simple-git-sync-log-row'); // full width, no name
+							// In controlEl: a redraw empties it, so the old box doesn't stay behind.
+							const log = setting.controlEl.createEl('textarea', { cls: 'simple-git-sync-log', attr: { readonly: '', rows: '16' } });
+							log.value = plugin.log.join('\n');
+							// Next frame: a row that's being shown is still hidden while it renders, with nothing to scroll.
+							log.win.requestAnimationFrame(() => (log.scrollTop = log.scrollHeight));
+						},
+					},
+				],
+			},
+		];
+	}
 
-		el.empty();
-
-		if (!plugin.hasRepo) {
-			new Setting(el)
-				.setName('No repository in this vault')
-				.setDesc('Clone one to start syncing.')
-				.addButton((b) => b.setButtonText('Clone').setCta().onClick(() => plugin.openClone()));
-		}
-
-		if (Platform.isDesktop) {
-			new Setting(el)
-				.setName('Engine')
-				.setDesc('Native uses your installed Git and SSH keys. Built-in is what mobile uses: HTTPS and a token.')
-				.addDropdown((d) =>
-					d.addOptions({ native: 'Native git', builtin: 'Built-in' }).setValue(s.engine).onChange(async (value) => {
-						s.engine = value as Settings['engine'];
-						if (s.engine === 'builtin') await plugin.prefillBuiltin();
-						await redraw();
-					}),
-				);
-		}
-		if (plugin.usesBuiltin) {
-			text('Repository URL', 'HTTPS, for example https://github.com/you/notes.git', 'url');
-			new Setting(el)
-				.setName('Token')
-				.setDesc('A fine-grained token with access to this repository only, and contents set to read and write.')
-				.addComponent((c) =>
-					new SecretComponent(this.app, c).setValue(s.token).onChange(async (value) => {
-						s.token = value ?? '';
-						await save();
-					}),
-				);
-			text('Author name', 'Used for commits from this device.', 'authorName');
-			text('Author email', 'Used for commits from this device.', 'authorEmail');
-		}
-		text('Device name', 'Shown in commit messages.', 'deviceName');
-
-		new Setting(el).setName('Pull').setHeading();
-		toggle('Pull on open and on return to the app', '', 'pullOnOpen');
-		if (!s.discard) number('Pull every N minutes', '0 turns it off.', 'pullInterval');
-		toggle(
-			'Discard local changes once a day',
-			'For a device you only read on, like a daily checklist. Once a day, resets this device to the remote, unpushed commits included. Discarded files are copied to .trash/simple-git-sync/ first. Pulls in between keep your changes. Turns push off.',
-			'discard',
-			true,
-		);
-
-		if (s.discard) {
-			new Setting(el)
-				.setName('Reset at')
-				.setDesc('Every day at this time. If the app is closed then, the first pull after it resets.')
-				.addText((t) => {
-					t.inputEl.type = 'time';
-					t.setValue(s.resetTime).onChange(async (value) => {
-						if (!/^\d\d:\d\d$/.test(value)) return; // cleared or half typed: keep the last time
-						s.resetTime = value;
-						await save();
-					});
-				});
-		} else {
-			new Setting(el).setName('Push').setHeading();
-			new Setting(el).setName('Push automatically').addDropdown((d) =>
-				d
-					.addOptions({ off: 'Off', idle: 'After I stop editing', interval: 'Every N minutes' })
-					.setValue(s.pushMode)
-					.onChange(async (value) => {
-						s.pushMode = value as Settings['pushMode'];
-						await redraw();
-					}),
-			);
-			if (s.pushMode === 'idle') number('Seconds after you stop editing', '', 'pushIdle');
-			if (s.pushMode === 'interval') number('Push every N minutes', '', 'pushInterval');
-			if (s.pushMode !== 'off') toggle('Push when the app goes to the background', 'Best effort: the system may close the app first.', 'pushOnBackground');
-		}
-
-		new Setting(el).setName('Developer').setHeading();
-		toggle('Show sync log', '', 'showLog', true);
-		if (s.showLog) {
-			const log = el.createEl('textarea', { cls: 'simple-git-sync-log', attr: { readonly: '', rows: '16' } });
-			log.value = plugin.log.join('\n');
-			log.scrollTop = log.scrollHeight;
-		}
+	/** Saved as PluginSettingTab saves it, trimmed, then the timers restart to match. */
+	async setControlValue(key: string, value: unknown) {
+		const { plugin } = this;
+		if (key === 'engine' && value === 'builtin') await plugin.prefillBuiltin();
+		// null: the token was cleared.
+		await super.setControlValue(key, typeof value === 'string' ? value.trim() : (value ?? ''));
+		plugin.applyTimers();
+		// Redrawn for what prefillBuiltin() filled in, and for the log as it is now.
+		if (key === 'engine' || key === 'showLog') this.update();
 	}
 }

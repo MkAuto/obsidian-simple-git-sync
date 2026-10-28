@@ -49,7 +49,18 @@ export interface Engine {
 }
 
 type Log = (text: string) => void;
-type ExecFile = typeof import('child_process').execFile;
+
+// Node's types, by hand and only as far as NativeGit uses them: Obsidian's plugin review type-checks without
+// @types/node, so Node's own types read as unsafe there.
+/** Environment variables, like `process.env`. */
+export type Env = Record<string, string | undefined>;
+/** Node's `child_process.execFile`, with `encoding: 'buffer'`. */
+export type ExecFile = (
+	file: string,
+	args: string[],
+	options: { cwd: string; env: Env; encoding: 'buffer'; timeout: number; maxBuffer: number; windowsHide: boolean },
+	callback: (error: { code?: number | string | null; killed?: boolean; message: string } | null, stdout: Uint8Array, stderr: Uint8Array) => void,
+) => { stdin: { end(data: Uint8Array): void } | null };
 
 const split = (out: string) => out.split('\0').filter(Boolean);
 
@@ -76,12 +87,14 @@ const device = (message: string, author: string) => /^Sync: (.+) \d{4}-\d\d-\d\d
 export class NativeGit implements Engine {
 	private cwd: string;
 	private execFile: ExecFile;
+	private env: Env;
 	private log: Log;
 
-	/** `execFile` is passed in: this file can't import Node modules, or the plugin breaks on mobile. */
-	constructor(cwd: string, execFile: ExecFile, log: Log) {
+	/** `execFile` and `env` are passed in: this file can't import Node modules, or the plugin breaks on mobile. */
+	constructor(cwd: string, execFile: ExecFile, env: Env, log: Log) {
 		this.cwd = cwd;
 		this.execFile = execFile;
+		this.env = env;
 		this.log = log;
 	}
 
@@ -95,8 +108,7 @@ export class NativeGit implements Engine {
 					cwd: this.cwd,
 					// ponytail: nothing can answer an SSH passphrase prompt here, so a hung command times out instead.
 					// GIT_DIR: a broken .git is an error, not a reason to look for a repo in the folders above the vault.
-					// eslint-disable-next-line no-undef -- desktop only, where Node's process exists
-					env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_DIR: '.git' },
+					env: { ...this.env, GIT_TERMINAL_PROMPT: '0', GIT_DIR: '.git' },
 					encoding: 'buffer',
 					timeout: 120_000,
 					maxBuffer: 64 << 20,
@@ -107,7 +119,7 @@ export class NativeGit implements Engine {
 					resolve({
 						code: error ? (typeof error.code === 'number' ? error.code : -1) : 0,
 						out,
-						err: err.toString() || timedOut || error?.message || '',
+						err: text(err) || timedOut || error?.message || '',
 					});
 				},
 			);

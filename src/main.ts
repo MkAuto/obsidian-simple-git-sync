@@ -1,11 +1,12 @@
-import { debounce, FileSystemAdapter, MarkdownView, moment, normalizePath, Notice, Platform, Plugin } from 'obsidian';
+import { debounce, FileSystemAdapter, MarkdownView, normalizePath, Notice, Platform, Plugin } from 'obsidian';
 import type { Debouncer } from 'obsidian';
 import { CloneModal } from './clone-modal';
 import { ConflictModal } from './conflict-modal';
 import { BuiltinGit, NativeGit, PushRejected } from './git';
-import type { Conflict, Engine } from './git';
+import type { Conflict, Engine, Env, ExecFile } from './git';
 import { DEFAULT_SETTINGS, SettingTab } from './settings';
 import type { Settings } from './settings';
+import { ago, format } from './time';
 import { ensureFolder, http, vaultFs } from './vault-io';
 
 const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -17,7 +18,17 @@ const isQuiet = (e: unknown) =>
 	/Could not resolve host|Connection (timed out|refused|reset)|Network is unreachable|Temporary failure in name resolution/i.test(errorText(e));
 
 // To the millisecond: two syncs in the same second mustn't share a folder and overwrite each other's copies.
-const backupFolder = () => `.trash/simple-git-sync/${moment().format('YYYY-MM-DD_HH-mm-ss-SSS')}`;
+const backupFolder = () => `.trash/simple-git-sync/${format(Date.now(), 'YYYY-MM-DD_HH-mm-ss-SSS')}`;
+
+/** Node's modules, as far as this file uses them. Typed by hand, like ExecFile in git.ts. */
+interface NodeModules {
+	child_process: { execFile: ExecFile };
+	os: { hostname(): string };
+	process: { env: Env };
+}
+
+// Desktop only. Required when needed, not imported: mobile has no Node modules, and Obsidian's renderer can't import() them.
+const node = <K extends keyof NodeModules>(id: K) => (window as unknown as { require(id: K): NodeModules[K] }).require(id);
 
 export default class SimpleGitSync extends Plugin {
 	settings: Settings = { ...DEFAULT_SETTINGS };
@@ -102,7 +113,7 @@ export default class SimpleGitSync extends Plugin {
 			const s = this.settings;
 			const git = this.engine();
 			await this.saveEditors();
-			const committed = await git.commitAll(`Sync: ${s.deviceName} ${moment().format('YYYY-MM-DD HH:mm')}`);
+			const committed = await git.commitAll(`Sync: ${s.deviceName} ${format(Date.now(), 'YYYY-MM-DD HH:mm')}`);
 			await git.fetch();
 			if (s.discard && this.resetDue) {
 				await this.toTrash(await git.localChanges());
@@ -167,19 +178,18 @@ export default class SimpleGitSync extends Plugin {
 
 	/** Discard mode resets once a day: due when the last reset is older than the latest reset time. */
 	private get resetDue() {
-		const at = moment(this.settings.resetTime, 'HH:mm');
-		if (at.isAfter()) at.subtract(1, 'day');
-		return this.settings.lastReset < at.valueOf();
+		const [hours = 0, minutes = 0] = this.settings.resetTime.split(':').map(Number);
+		const at = new Date();
+		at.setHours(hours, minutes, 0, 0);
+		if (at.getTime() > Date.now()) at.setDate(at.getDate() - 1);
+		return this.settings.lastReset < at.getTime();
 	}
 
 	private native() {
 		if (!Platform.isDesktop) return null;
 		const { adapter } = this.app.vault;
 		if (!(adapter instanceof FileSystemAdapter)) return null;
-		// Required here, not imported: mobile has no Node modules, and Obsidian's renderer can't import() them.
-		// eslint-disable-next-line @typescript-eslint/no-require-imports, no-undef -- desktop-only require, see above
-		const { execFile } = require('child_process') as typeof import('child_process');
-		return new NativeGit(adapter.getBasePath(), execFile, (text) => this.addLog(text));
+		return new NativeGit(adapter.getBasePath(), node('child_process').execFile, node('process').env, (text) => this.addLog(text));
 	}
 
 	private engine(): Engine {
@@ -213,7 +223,7 @@ export default class SimpleGitSync extends Plugin {
 
 	addLog(text: string) {
 		const token = this.token();
-		const time = moment().format('HH:mm:ss');
+		const time = format(Date.now(), 'HH:mm:ss');
 		for (let line of text.split('\n')) {
 			if (token) line = line.split(token).join('***');
 			this.log.push(`${time} ${line.replace(/\/\/[^/\s@]+@/g, '//***@')}`);
@@ -320,7 +330,7 @@ export default class SimpleGitSync extends Plugin {
 	}
 
 	private showStatus() {
-		this.statusEl?.setText(this.syncing ? 'Syncing…' : this.lastSync ? `Synced ${moment(this.lastSync).fromNow()}` : '');
+		this.statusEl?.setText(this.syncing ? 'Syncing…' : this.lastSync ? `Synced ${ago(this.lastSync)}` : '');
 	}
 
 	openClone() {
@@ -336,8 +346,7 @@ export default class SimpleGitSync extends Plugin {
 		this.settings = { ...DEFAULT_SETTINGS, ...((await this.loadData()) as Partial<Settings> | null) };
 		if (this.settings.deviceName) return;
 		if (Platform.isDesktop) {
-			// eslint-disable-next-line @typescript-eslint/no-require-imports, no-undef -- desktop-only, like native()
-			this.settings.deviceName = (require('os') as typeof import('os')).hostname();
+			this.settings.deviceName = node('os').hostname();
 		} else {
 			this.settings.deviceName = 'Mobile';
 		}

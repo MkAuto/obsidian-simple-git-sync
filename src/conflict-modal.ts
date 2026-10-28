@@ -1,9 +1,11 @@
-import { Modal, moment, Notice, Setting } from 'obsidian';
+import { Modal, Notice, Setting } from 'obsidian';
 import type { Conflict } from './git';
 import type SimpleGitSync from './main';
+import { format } from './time';
 
 const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
-const when = (time: number) => moment(time).format(moment(time).isSame(moment(), 'day') ? 'HH:mm' : 'YYYY-MM-DD HH:mm');
+const day = (time: number) => format(time, 'YYYY-MM-DD');
+const when = (time: number) => format(time, day(time) === day(Date.now()) ? 'HH:mm' : 'YYYY-MM-DD HH:mm');
 const device = (c: Conflict, side: Conflict['kept']) => (side === 'local' ? 'this device' : c.remote.device);
 const other = (side: Conflict['kept']) => (side === 'local' ? 'remote' : 'local');
 

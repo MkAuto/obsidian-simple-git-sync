@@ -110,7 +110,7 @@ const text = (data) => (data ? Buffer.from(data).toString() : null);
 const parents = (dir) => sh(dir, 'rev-list', '--parents', '-n', '1', 'HEAD').trim().split(' ').slice(1);
 
 const engines = {
-	native: (dir) => new NativeGit(dir, execFile, () => {}),
+	native: (dir) => new NativeGit(dir, execFile, process.env, () => {}),
 	builtin: (dir) => new BuiltinGit({ fs, dir, http: null, token: '', author, log: () => {} }),
 };
 // isomorphic-git can't fetch from a local path, so the built-in engine gets the remote ref copied in.
