@@ -1,7 +1,7 @@
 {
 	"id": "simple-git-sync",
 	"name": "Simple Git Sync",
-	"version": "0.1.2",
+	"version": "0.1.3",
 	"minAppVersion": "1.13.2",
 	"description": "Automatically pull and push your vault to a single git repo, on desktop and mobile.",
 	"author": "Keven B.",
