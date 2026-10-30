@@ -1,5 +1,7 @@
 # Simple Git Sync
 
+**Disclaimer: I built this plugin to challenge myself to learn the inner workings of git. There are tons of better plugins to sync your vault between device. It's built specifically for my needs**
+
 Keeps an Obsidian vault in sync with one git repository, on desktop and mobile, without merge conflicts.
 
 It pulls when you open or return to the app and pushes shortly after you stop editing, so you rarely edit a stale copy. When two devices change the same lines anyway, the most recent change wins, the other version is kept in `.trash/simple-git-sync/`, and a notice lets you swap it back in.
