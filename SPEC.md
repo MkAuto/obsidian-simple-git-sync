@@ -63,6 +63,7 @@ The vault root, one branch, remote `origin`.
 - For a device that's only read on, like a daily checklist: changes made there last until the next reset.
 - Once a day, at a per-device time (default 00:00), the device resets to the remote, including unpushed commits. If the app is closed then, the first pull after it resets.
 - Pulls in between merge as usual: the remote's updates arrive, local changes stay.
+- "Keep files added on this device" (default off): files only this device added (the remote doesn't have them, and didn't when the two last agreed) survive the reset, local edits included. They're committed locally, never pushed. A path the remote also added takes the remote's version.
 - Discarded files are copied to `.trash/simple-git-sync/` first.
 - While it's on, push is off (Sync now included), and the push settings and "Pull every N minutes" are hidden.
 
@@ -92,6 +93,7 @@ The vault root, one branch, remote `origin`.
 9. The built-in engine updates the files before it moves the branch, for merges and discards alike. If the app dies halfway, the next sync sees the updated files as local edits that agree with the remote.
 10. Disabling the plugin lets a running sync finish and stops anything else: a pending idle push, a queued run.
 11. Every sync first saves open notes, so typing Obsidian hasn't saved yet (it waits about 2 seconds) is part of the commit and gets the same conflict handling as any other edit. Changes a pull commits this way go out with the idle push.
+12. A push still owed (cut short by the app closing or being suspended, or offline) starts the idle push at the next pull. Edits saved during a sync, after its commit, start the idle push when it ends. A push sync with nothing to push skips the push.
 
 ## Development
 

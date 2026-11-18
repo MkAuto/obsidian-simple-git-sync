@@ -223,6 +223,27 @@ for (const [name, make] of Object.entries(engines)) {
 		});
 	}
 
+	test(`${name}: ahead tells whether a push is still owed`, async () => {
+		const { a, b } = setup();
+		const git = make(b);
+		assert.equal(await git.ahead(), false);
+
+		write(a, 'note.md', BASE.replace('one', 'one-A'));
+		sh(a, 'commit', '-qam', 'from a');
+		sh(a, 'push', '-q');
+		await fetch(name, git, b);
+		assert.equal(await git.ahead(), false); // behind is not ahead
+
+		write(b, 'other.md', 'edited on b\n');
+		await git.commitAll('local');
+		assert.equal(await git.ahead(), true);
+		await git.merge(true, async () => {});
+		assert.equal(await git.ahead(), true); // the push never happened: still owed after the next pull
+		sh(b, 'push', '-q');
+		sh(b, 'fetch', '-q');
+		assert.equal(await git.ahead(), false);
+	});
+
 	test(`${name}: discard lists local changes, then resets to the remote`, async () => {
 		const { a, b } = setup();
 		diverge(a, b);
@@ -230,13 +251,55 @@ for (const [name, make] of Object.entries(engines)) {
 
 		await git.commitAll('local');
 		await fetch(name, git, b);
-		assert.deepEqual((await git.localChanges()).sort(), ['gone.md', 'img.bin', 'new.md', 'note.md']);
-		await git.resetToRemote();
+		assert.deepEqual((await git.localChanges(false)).sort(), ['gone.md', 'img.bin', 'new.md', 'note.md']);
+		await git.resetToRemote(false);
 
 		assert.equal(read(b, 'note.md'), BASE.replace('two', 'two-A'));
 		assert.equal(read(b, 'gone.md'), null);
 		assert.equal(read(b, 'new.md'), null);
 		assert.equal(sh(b, 'rev-parse', 'HEAD'), sh(b, 'rev-parse', 'origin/main'));
+	});
+
+	test(`${name}: discard with keepAdded keeps files only this device added`, async () => {
+		const { a, b } = setup();
+		diverge(a, b);
+		fs.mkdirSync(join(b, 'mine/deep'), { recursive: true });
+		write(b, 'mine/deep/list.md', 'b only, nested\n');
+		write(b, 'both.md', 'b version\n'); // the remote adds the same path: not this device's alone
+		write(a, 'both.md', 'a version\n');
+		sh(a, 'add', '-A');
+		sh(a, 'commit', '-qm', 'a adds both.md');
+		sh(a, 'push', '-q');
+		const git = make(b);
+
+		await git.commitAll('local');
+		await fetch(name, git, b);
+		assert.deepEqual((await git.localChanges(true)).sort(), ['both.md', 'gone.md', 'img.bin', 'note.md']);
+		await git.resetToRemote(true);
+
+		assert.equal(read(b, 'note.md'), BASE.replace('two', 'two-A'));
+		assert.equal(read(b, 'gone.md'), null); // a deleted it: b only edited it
+		assert.equal(read(b, 'both.md'), 'a version\n');
+		assert.equal(read(b, 'new.md'), 'only on b\n');
+		assert.equal(read(b, 'mine/deep/list.md'), 'b only, nested\n');
+		assert.equal(sh(b, 'rev-parse', 'HEAD'), sh(b, 'rev-parse', 'origin/main'));
+		assert.equal(sh(b, 'status', '--porcelain', '-uall'), '?? mine/deep/list.md\n?? new.md\n');
+
+		// The next day: committed again locally, kept again, the remote never sees them.
+		write(a, 'other.md', 'other, day two\n');
+		sh(a, 'commit', '-qam', 'day two');
+		sh(a, 'push', '-q');
+		await git.commitAll('day two');
+		await fetch(name, git, b);
+		await git.merge(false, async () => {});
+		assert.deepEqual(await git.localChanges(true), []);
+		await git.resetToRemote(true);
+
+		assert.equal(read(b, 'other.md'), 'other, day two\n');
+		assert.equal(read(b, 'new.md'), 'only on b\n');
+		assert.equal(read(b, 'mine/deep/list.md'), 'b only, nested\n');
+		assert.equal(sh(b, 'rev-parse', 'HEAD'), sh(b, 'rev-parse', 'origin/main'));
+		assert.equal(sh(a, 'ls-tree', '-r', '--name-only', 'origin/main').includes('new.md'), false);
 	});
 }
 

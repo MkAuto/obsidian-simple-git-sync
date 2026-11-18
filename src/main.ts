@@ -38,6 +38,7 @@ export default class SimpleGitSync extends Plugin {
 	/** Files syncs settled for one side, one entry per file, until settled in the conflicts window. In memory only. */
 	conflicts = new Map<string, Conflict>();
 	private syncing = false;
+	private editedWhileSyncing = false; // vault events after a sync's commit: maybe typing it didn't take
 	private unloaded = false;
 	private queued: boolean | null = null; // push flag of the one sync waiting behind the running one
 	private lastSync = 0;
@@ -87,9 +88,11 @@ export default class SimpleGitSync extends Plugin {
 			}
 		});
 		// Registered after layout ready, so the vault's startup 'create' flood doesn't count.
-		// A pull writes files too; those aren't edits.
+		// A pull writes files too, and can't be told apart from typing: events during a sync start the idle push once
+		// it ends. When they were only the pull's writes, that push finds nothing to commit or push.
 		const onEdit = () => {
-			if (!this.syncing) this.pushSoon?.();
+			if (this.syncing) this.editedWhileSyncing = true;
+			else this.pushSoon?.();
 		};
 		this.registerEvent(this.app.vault.on('create', onEdit));
 		this.registerEvent(this.app.vault.on('modify', onEdit));
@@ -114,10 +117,11 @@ export default class SimpleGitSync extends Plugin {
 			const git = this.engine();
 			await this.saveEditors();
 			const committed = await git.commitAll(`Sync: ${s.deviceName} ${format(Date.now(), 'YYYY-MM-DD HH:mm')}`);
+			this.editedWhileSyncing = false; // what was saved until now is in that commit
 			await git.fetch();
 			if (s.discard && this.resetDue) {
-				await this.toTrash(await git.localChanges());
-				await git.resetToRemote();
+				await this.toTrash(await git.localChanges(s.keepAdded));
+				await git.resetToRemote(s.keepAdded);
 				s.lastReset = Date.now();
 				await this.saveData(s);
 			} else {
@@ -127,12 +131,13 @@ export default class SimpleGitSync extends Plugin {
 					// The discard device takes the remote's side without a word: it resets every day anyway.
 					if (conflicts.length && !s.discard) this.notifyConflicts(conflicts);
 					if (!push) {
-						// What saveEditors() wrote was saved mid-sync, so it never started the idle push.
-						if (committed) this.pushSoon?.();
+						// Owed a push: this sync committed (saveEditors() wrote mid-sync, so it never started the idle
+						// push), or an earlier push never finished (app closed or suspended, offline).
+						if (this.pushSoon && (committed || (await git.ahead()))) this.pushSoon();
 						break;
 					}
 					try {
-						await git.push();
+						if (await git.ahead()) await git.push(); // nothing owed: skip the round trip
 						break;
 					} catch (e) {
 						if (!(e instanceof PushRejected) || attempt === 3) throw e;
@@ -147,6 +152,7 @@ export default class SimpleGitSync extends Plugin {
 			if (!isQuiet(e)) new Notice(`Simple Git Sync: ${errorText(e)}`);
 		} finally {
 			this.syncing = false;
+			if (this.editedWhileSyncing && !this.unloaded) this.pushSoon?.();
 			this.showStatus();
 			const next = this.queued;
 			this.queued = null;

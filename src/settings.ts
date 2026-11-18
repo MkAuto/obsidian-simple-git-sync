@@ -9,6 +9,7 @@ export interface Settings {
 	pullOnOpen: boolean;
 	pullInterval: number; // minutes, 0 = off
 	discard: boolean;
+	keepAdded: boolean; // discard mode keeps files only this device added
 	resetTime: string; // HH:mm, when discard mode resets this device each day
 	lastReset: number; // when discard mode last reset this device, in ms; not shown
 	pushMode: 'off' | 'idle' | 'interval';
@@ -28,6 +29,7 @@ export const DEFAULT_SETTINGS: Settings = {
 	pullOnOpen: true,
 	pullInterval: 0,
 	discard: false,
+	keepAdded: false,
 	resetTime: '00:00',
 	lastReset: 0,
 	pushMode: 'idle',
@@ -88,6 +90,12 @@ export class SettingTab extends PluginSettingTab {
 						name: 'Discard local changes once a day',
 						desc: 'For a device you only read on, like a daily checklist. Once a day, resets this device to the remote, unpushed commits included. Discarded files are copied to .trash/simple-git-sync/ first. Pulls in between keep your changes. Turns push off.',
 						control: { type: 'toggle', key: 'discard' },
+					},
+					{
+						name: 'Keep files added on this device',
+						desc: 'The reset leaves files you created here in place, edits included. They are never pushed. A file another device also added at the same path takes its version.',
+						visible: () => s.discard,
+						control: { type: 'toggle', key: 'keepAdded' },
 					},
 					{
 						name: 'Reset at',

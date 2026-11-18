@@ -40,10 +40,16 @@ export interface Engine {
 	 * Lines only one side changed are kept from both. `beforeOverwrite` gets the conflicts before any file is written.
 	 */
 	merge(newestWins: boolean, beforeOverwrite: (conflicts: Conflict[]) => Promise<void>): Promise<Conflict[]>;
-	/** Files whose local version differs from the fetched remote: what a reset throws away. */
-	localChanges(): Promise<string[]>;
-	resetToRemote(): Promise<void>;
+	/** Files whose local version differs from the fetched remote: what a reset with the same `keepAdded` throws away. */
+	localChanges(keepAdded: boolean): Promise<string[]>;
+	/**
+	 * Resets to the fetched remote. With `keepAdded`, files only this device added (the remote never had them since
+	 * the two split) stay on disk, untracked, until the next commit takes them back. They're never pushed.
+	 */
+	resetToRemote(keepAdded: boolean): Promise<void>;
 	push(): Promise<void>;
+	/** Whether this device has commits the fetched remote doesn't: a push is still owed. */
+	ahead(): Promise<boolean>;
 	/** Drops a file from the index but keeps it on disk. */
 	untrack(path: string): Promise<void>;
 }
@@ -203,11 +209,26 @@ export class NativeGit implements Engine {
 		return result.code === 0 ? new Uint8Array(result.out) : null;
 	}
 
-	async localChanges() {
-		return split(await this.git('diff', '--name-only', '-z', '--no-renames', '--diff-filter=d', '@{u}', 'HEAD'));
+	/** Files this device added that the remote has never had since their histories split. */
+	private async added() {
+		// `@{u}...HEAD` diffs from the merge base: a file the remote deleted was there, so it isn't one this device added.
+		const sinceBase = new Set(split(await this.git('diff', '--name-only', '-z', '--no-renames', '--diff-filter=A', '@{u}...HEAD')));
+		return split(await this.git('diff', '--name-only', '-z', '--no-renames', '--diff-filter=A', '@{u}', 'HEAD')).filter((path) => sinceBase.has(path));
 	}
 
-	async resetToRemote() {
+	async localChanges(keepAdded: boolean) {
+		const added = new Set(keepAdded ? await this.added() : []);
+		return split(await this.git('diff', '--name-only', '-z', '--no-renames', '--diff-filter=d', '@{u}', 'HEAD')).filter((path) => !added.has(path));
+	}
+
+	async resetToRemote(keepAdded: boolean) {
+		// A hard reset leaves untracked files alone: untracking the added ones keeps them, and the next commit takes them back.
+		const added = keepAdded ? await this.added() : [];
+		if (added.length) {
+			const result = await this.exec(['rm', '-q', '--cached', '--pathspec-from-file=-', '--pathspec-file-nul'], new TextEncoder().encode(added.join('\0')));
+			this.log(`git rm --cached ${added.join(', ')}\n${result.err}`.trimEnd());
+			if (result.code !== 0) throw new Error(result.err.trim() || 'git rm failed');
+		}
 		await this.git('reset', '-q', '--hard', '@{u}');
 	}
 
@@ -215,6 +236,10 @@ export class NativeGit implements Engine {
 		const result = await this.run('push', '-q');
 		if (/\[rejected\].*\((fetch first|non-fast-forward)\)/.test(result.err)) throw new PushRejected();
 		if (result.code !== 0) throw new Error(result.err.trim() || 'git push failed');
+	}
+
+	async ahead() {
+		return Number(await this.git('rev-list', '--count', '@{u}..HEAD')) > 0;
 	}
 
 	async untrack(path: string) {
@@ -452,14 +477,32 @@ export class BuiltinGit implements Engine {
 		return result.length ? git.writeTree({ ...this.repo, tree: result }) : null;
 	}
 
-	async localChanges() {
-		const { remote } = await this.branch();
-		const rows = await git.statusMatrix({ ...this.repo, ref: remote });
-		return rows.filter(([, , workdir]) => workdir === 2).map(([filepath]) => filepath);
+	/** Files this device added that the remote has never had since their histories split. */
+	private async added() {
+		const { branch, remote } = await this.branch();
+		const [ours, theirs] = [await git.resolveRef({ ...this.repo, ref: branch }), await git.resolveRef({ ...this.repo, ref: remote })];
+		const [base] = (await git.findMergeBase({ ...this.repo, oids: [ours, theirs] })) as string[];
+		// A file the remote deleted was in the merge base, so it isn't one this device added.
+		const trees = [git.TREE({ ref: ours }), git.TREE({ ref: theirs }), ...(base ? [git.TREE({ ref: base })] : [])];
+		return (await git.walk({
+			...this.repo,
+			trees,
+			map: async (filepath, [mine, ...others]) =>
+				filepath !== '.' && (await mine?.type()) === 'blob' && others.every((entry) => !entry) ? filepath : undefined,
+		})) as string[];
 	}
 
-	async resetToRemote() {
+	async localChanges(keepAdded: boolean) {
+		const { remote } = await this.branch();
+		const added = new Set(keepAdded ? await this.added() : []);
+		const rows = await git.statusMatrix({ ...this.repo, ref: remote });
+		return rows.filter(([filepath, , workdir]) => workdir === 2 && !added.has(filepath)).map(([filepath]) => filepath);
+	}
+
+	async resetToRemote(keepAdded: boolean) {
 		const { branch, remote } = await this.branch();
+		// Checkout only deletes what the index tracks: untracking the added files keeps them, and the next commit takes them back.
+		for (const filepath of keepAdded ? await this.added() : []) await git.remove({ ...this.repo, filepath });
 		await this.moveBranch(branch, await git.resolveRef({ ...this.repo, ref: remote }), true);
 		this.o.log(`reset to ${remote}`);
 	}
@@ -477,6 +520,13 @@ export class BuiltinGit implements Engine {
 		if (Object.values(result.refs).some(({ error }) => /fast-forward|fetch first|failed to update ref/.test(error ?? ''))) throw new PushRejected();
 		if (!result.ok) throw new Error(result.error ?? 'push rejected');
 		this.o.log('push');
+	}
+
+	async ahead() {
+		const { branch, remote } = await this.branch();
+		const ours = await git.resolveRef({ ...this.repo, ref: branch });
+		const theirs = await git.resolveRef({ ...this.repo, ref: remote });
+		return ours !== theirs && !(await git.isDescendent({ ...this.repo, oid: theirs, ancestor: ours, depth: -1 }));
 	}
 
 	async untrack(filepath: string) {
